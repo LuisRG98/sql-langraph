@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     max_sql_retries: int = Field(default=3, ge=0, le=10)
     max_rows: int = Field(default=100, ge=1, le=1000)
 
+    sql_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+
     @property
     def langfuse_enabled(self) -> bool:
         return bool(self.langfuse_public_key and self.langfuse_secret_key.get_secret_value())
