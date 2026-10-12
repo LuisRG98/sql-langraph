@@ -1,13 +1,16 @@
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import date
 from typing import Any
 
-from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.callbacks import BaseCallbackHandler, CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 from sqlalchemy import Engine
 
+from app.core.observability import ScoreSpec, TraceHandle
 from app.db.guardrail import SQLValidator
 from app.db.hints import SCHEMA_HINTS
 from app.db.schema import extract_schema
@@ -63,3 +66,55 @@ def build_test_agent(engine: Engine, llm: BaseChatModel, *, max_rows: int = 100)
         today_fn=lambda: date(2026, 10, 7),
     )
     return build_graph(deps)
+
+class CountingCallback(BaseCallbackHandler):
+    """Cuenta cuántas veces se llamó a un modelo de chat."""
+
+    def __init__(self) -> None:
+        self.llm_calls = 0
+
+    def on_chat_model_start(
+        self, serialized: dict[str, Any], messages: list[list[BaseMessage]], **kwargs: Any
+    ) -> Any:
+        self.llm_calls += 1
+
+
+class RecordingHandle(TraceHandle):
+    def __init__(self, callback: CountingCallback) -> None:
+        super().__init__(callbacks=[callback])
+        self.recorded: dict[str, Any] | None = None
+
+    def record(self, *, inputs: Any, outputs: Any, scores: Sequence[ScoreSpec]) -> None:
+        self.recorded = {"inputs": inputs, "outputs": outputs, "scores": list(scores)}
+
+
+class RecordingTracer:
+    """Tracer falso: guarda cómo se abrió cada traza y qué se registró."""
+
+    def __init__(self) -> None:
+        self.opened: list[dict[str, Any]] = []
+        self.handles: list[RecordingHandle] = []
+        self.callback = CountingCallback()
+
+    @contextmanager
+    def __call__(
+        self,
+        name: str,
+        *,
+        session_id: str | None,
+        user_id: str | None,
+        tags: Sequence[str],
+        metadata: dict[str, str] | None,
+    ) -> Iterator[TraceHandle]:
+        self.opened.append(
+            {
+                "name": name,
+                "session_id": session_id,
+                "user_id": user_id,
+                "tags": list(tags),
+                "metadata": metadata,
+            }
+        )
+        handle = RecordingHandle(self.callback)
+        self.handles.append(handle)
+        yield handle
