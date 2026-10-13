@@ -17,6 +17,9 @@ from app.graph.state import GraphState, initial_state
 MAX_QUESTION_LENGTH = 500
 TRACE_NAME = "text2sql-query"
 
+class InvalidQuestionError(ValueError):
+    """La pregunta no cumple las reglas de entrada."""
+
 
 class AttemptRecord(BaseModel):
     sql: str
@@ -69,9 +72,9 @@ class QueryService:
     ) -> QueryResponse:
         question = question.strip()
         if not question:
-            raise ValueError("La pregunta no puede estar vacía.")
+            raise InvalidQuestionError("La pregunta no puede estar vacía.")
         if len(question) > MAX_QUESTION_LENGTH:
-            raise ValueError(f"La pregunta supera los {MAX_QUESTION_LENGTH} caracteres.")
+            raise InvalidQuestionError(f"La pregunta supera los {MAX_QUESTION_LENGTH} caracteres.")
 
         with self._tracer(
             TRACE_NAME,

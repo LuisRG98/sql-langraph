@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/shop.db"
     max_sql_retries: int = Field(default=3, ge=0, le=10)
     max_rows: int = Field(default=100, ge=1, le=1000)
+    cors_origins: list[str] = ["http://localhost:5173"]
+    rate_limit_per_minute: int = Field(default=10, ge=1, le=1000)
 
     sql_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
 
