@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -188,3 +189,105 @@ def test_cors_rejects_other_origins(make_client: Callable[..., TestClient]) -> N
         headers={"Origin": "http://sitio-malicioso.example", "Access-Control-Request-Method": "POST"},
     )
     assert "access-control-allow-origin" not in response.headers
+
+
+# ------------------------------------------------------------------ /api/query/stream
+
+
+def parse_sse(text: str) -> list[tuple[str, dict[str, Any]]]:
+    events: list[tuple[str, dict[str, Any]]] = []
+    for block in text.strip().split("\n\n"):
+        lines = block.splitlines()
+        if not lines or lines[0].startswith(":"):  # comentario / keep-alive
+            continue
+        name = lines[0].removeprefix("event: ")
+        data = json.loads(lines[1].removeprefix("data: "))
+        events.append((name, data))
+    return events
+
+
+def test_stream_happy_path(make_client: Callable[..., TestClient]) -> None:
+    client = make_client([COUNT_SQL, "Hay 50 clientes."])
+    response = client.post("/api/query/stream", json={"question": "¿Cuántos clientes hay?"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-request-id"]
+
+    events = parse_sse(response.text)
+    names = [data["node"] for name, data in events if name == "step"]
+    assert names == ["generate_sql", "validate_sql", "execute_sql", "explain_result"]
+    assert events[-1][0] == "result"
+    assert events[-1][1]["rows"] == [[50]]
+
+
+def test_stream_result_matches_the_normal_endpoint(
+    make_client: Callable[..., TestClient],
+) -> None:
+    payload = {"question": "¿Cuántos clientes hay?"}
+    normal = make_client([COUNT_SQL, "Hay 50."]).post("/api/query", json=payload).json()
+    streamed = parse_sse(
+        make_client([COUNT_SQL, "Hay 50."]).post("/api/query/stream", json=payload).text
+    )[-1][1]
+
+    assert streamed == normal
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"question": ""}, {"question": "x" * (MAX_QUESTION_LENGTH + 1)}, {"question": "ok", "session_id": "a b"}],
+)
+def test_stream_invalid_input_is_a_real_422_not_a_stream(
+    make_client: Callable[..., TestClient], payload: dict[str, Any]
+) -> None:
+    response = make_client([]).post("/api/query/stream", json=payload)
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_stream_is_rate_limited_before_streaming(make_client: Callable[..., TestClient]) -> None:
+    client = make_client(["CANNOT_ANSWER"], limit=1)
+    assert client.post("/api/query/stream", json={"question": "hola"}).status_code == 200
+
+    blocked = client.post("/api/query/stream", json={"question": "hola"})
+    assert blocked.status_code == 429
+    assert blocked.headers["retry-after"] == "60"
+
+
+def test_stream_provider_quota_is_an_error_event(make_client: Callable[..., TestClient]) -> None:
+    client = make_client([RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")])
+    response = client.post("/api/query/stream", json={"question": "hola"})
+
+    assert response.status_code == 200  # el estado HTTP ya estaba enviado
+    name, data = parse_sse(response.text)[-1]
+    assert name == "error"
+    assert data["status"] == 429
+
+
+def test_stream_unexpected_error_does_not_leak_details(
+    make_client: Callable[..., TestClient],
+) -> None:
+    client = make_client([RuntimeError("boom con detalles internos")])
+    response = client.post("/api/query/stream", json={"question": "hola"})
+
+    name, data = parse_sse(response.text)[-1]
+    assert name == "error"
+    assert data["status"] == 500
+    assert "Referencia" in data["detail"]
+    assert "boom" not in response.text
+
+
+def test_stream_session_id_reaches_the_trace(make_client: Callable[..., TestClient]) -> None:
+    tracer = RecordingTracer()
+    client = make_client([COUNT_SQL, "Hay 50."], tracer=tracer)
+    client.post("/api/query/stream", json={"question": "hola", "session_id": "demo-1"})
+
+    assert tracer.opened[0]["session_id"] == "demo-1"
+    assert tracer.opened[0]["user_id"] is None
+
+
+def test_openapi_documents_the_stream_endpoint(make_client: Callable[..., TestClient]) -> None:
+    paths = make_client([]).get("/openapi.json").json()["paths"]
+    assert "/api/query/stream" in paths
